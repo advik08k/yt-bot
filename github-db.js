@@ -6,7 +6,7 @@ const axios = require('axios');
 const DB_FILE = path.join(__dirname, 'db.json');
 const GITHUB_PAT = process.env.GITHUB_PAT || 'ghp_' + 'GvIC2UjW' + 'cbpjt20m' + 'nf0jN5KlJ' + 'GYwDD3vlUR3';
 const DB_SECRET = process.env.DB_SECRET || 'aryavam_super_secret_db_lock_123';
-const GITHUB_REPO = process.env.GITHUB_REPO || 'iamar' + 'yavam/y' + 't-bot';
+const GITHUB_REPO = process.env.GITHUB_REPO || 'advik08k/yt-bot';
 
 const DEFAULT_CLIENT_ID = '689705458149' + '-emip226aihenupohp' + 'hs6irsluabul5jn' + '.apps.googleusercontent.com';
 const DEFAULT_CLIENT_SECRET = 'GOCSPX' + '--bXW_3ca' + 'OFB2XtrTN' + 'L6Mvk915szg';
