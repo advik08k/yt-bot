@@ -1,0 +1,1 @@
+const youtubedl = require('youtube-dl-exec'); async function run() { try { console.log('Scraping...'); const ytInfo = await youtubedl('https://youtube.com/@officialvinu09/shorts', { print: '%(id)s|||%(title)s', flatPlaylist: true, noWarnings: true }); console.log('Done, lines:', ytInfo.trim().split('\n').length); } catch (e) { console.error('Error:', e); } } run();
