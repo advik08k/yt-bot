@@ -328,12 +328,12 @@ const tickEngine = async () => {
         const initRes = await fetch(`https://loader.to/ajax/download.php?format=1080&url=${encodeURIComponent(youtubeUrl)}`);
         const initData = await initRes.json();
         if (!initData.id) throw new Error("Loader.to failed.");
-        
+
         const taskId = initData.id;
         let downloadUrl = null;
-        
-        const maxRetries = type === 'shorts' ? 120 : 600; 
-        
+
+        const maxRetries = type === 'shorts' ? 120 : 600;
+
         for (let i = 0; i < maxRetries; i++) {
             await new Promise(r => setTimeout(r, 3000));
             const progressRes = await fetch(`https://loader.to/ajax/progress.php?id=${taskId}`);
@@ -346,18 +346,28 @@ const tickEngine = async () => {
                 addLog(`[~] Loader.to processing: ${progressData.progress || 0}/1000...`);
             }
         }
-        
+
         if (!downloadUrl) throw new Error("Loader.to timed out generating the video.");
-        
+
         addLog(`[+] Streaming video directly to Cloud Server disk (Saving RAM)...`);
-        const response = await fetch(downloadUrl);
-        if (!response.ok) throw new Error('Download failed from Loader.to');
-        
+        const response = await fetch(downloadUrl, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                'Referer': 'https://loader.to/',
+                'Accept': '*/*'
+            }
+        });
+        const contentLength = response.headers.get('content-length');
+        addLog(`[i] Loader.to CDN response: status=${response.status}, content-length=${contentLength || 'unknown'}`);
+        if (!response.ok) throw new Error(`Download failed from Loader.to (HTTP ${response.status})`);
+        if (contentLength === '0') throw new Error('Loader.to CDN returned an empty file (content-length: 0) - likely hotlink/bot protection or an expired link.');
+
         const { Readable } = require('stream');
         const { pipeline } = require('stream/promises');
-        
+
         await pipeline(Readable.fromWeb(response.body), fs.createWriteStream(videoPath));
         const stats = fs.statSync(videoPath);
+        if (stats.size === 0) throw new Error('Downloaded file is empty (0 bytes) - Loader.to likely returned a broken file.');
         addLog(`[+] Download stream complete. Size: ${(stats.size / 1024 / 1024).toFixed(2)} MB`);
 
         let generatedDescription = `${video.title}\n\n#shorts #viral #trending #aesthetic`; 
@@ -431,13 +441,25 @@ const tickEngine = async () => {
 
     } catch (e) {
         addLog(`[-] ERROR processing ${video.id}: ${e.message}`);
-        // Re-queue
+        // Re-queue (with a retry limit so one permanently-broken video can't block the queue forever)
         const recoveryDb = loadDB();
         const accToRecover = recoveryDb.accounts.find(a => a.id === accountToProcess.id);
         if (accToRecover) {
-            if (type === 'shorts') accToRecover.shortsQueue.unshift(video);
-            else accToRecover.longsQueue.unshift(video);
-            
+            const MAX_RETRIES = 3;
+            video.failCount = (video.failCount || 0) + 1;
+
+            if (video.failCount >= MAX_RETRIES) {
+                addLog(`[!] "${video.title}" (${video.id}) failed ${MAX_RETRIES}x. Skipping it permanently so the queue can move on.`);
+                // Mark as done so it's never re-added by scraping/queueing again
+                if (!accToRecover.uploadedVideos.includes(video.id)) {
+                    accToRecover.uploadedVideos.push(video.id);
+                }
+            } else {
+                addLog(`[~] Will retry "${video.title}" later (attempt ${video.failCount}/${MAX_RETRIES}). Moving it to the back of the queue.`);
+                if (type === 'shorts') accToRecover.shortsQueue.push(video);
+                else accToRecover.longsQueue.push(video);
+            }
+
             if (e.message.includes('uploadLimitExceeded') || e.message.toLowerCase().includes('quota')) {
                 addLog(`[!] Limit Reached for [${accToRecover.channelName}]. Auto-pausing account to prevent spam.`);
                 accToRecover.isPaused = true;
