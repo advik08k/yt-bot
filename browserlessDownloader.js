@@ -1,9 +1,5 @@
 const puppeteer = require('puppeteer-core');
-const axios = require('axios');
 const fs = require('fs');
-const { pipeline } = require('stream/promises');
-
-// Using the provided Browserless key
 const BROWSERLESS_TOKEN = process.env.BROWSERLESS_TOKEN || '2VJShxJ7icjitaGa2aa839c5565d28f882ae36a6463131355';
 
 async function browserlessDownload(youtubeUrl, videoPath, addLog) {
@@ -23,8 +19,6 @@ async function browserlessDownload(youtubeUrl, videoPath, addLog) {
 
     try {
         const page = await browser.newPage();
-        
-        // Use a generic user agent
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
         
         addLog(`[+] Requesting loader.to via Remote Browser...`);
@@ -59,33 +53,64 @@ async function browserlessDownload(youtubeUrl, videoPath, addLog) {
         if (!downloadUrl) {
             throw new Error('Timeout waiting for loader.to progress.');
         }
+        
+        addLog(`[+] Final URL obtained! Streaming file through Remote Browser to avoid IP locks...`);
+        
+        // --- CHUNKED DOWNLOAD LOGIC ---
+        // Open a new page on the exact same domain to bypass CORS
+        const finalHost = new URL(downloadUrl).origin;
+        addLog(`[+] Navigating to ${finalHost} for CORS bypass...`);
+        const fetchPage = await browser.newPage();
+        await fetchPage.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
+        await fetchPage.goto(finalHost, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+
+        let fileStream = fs.createWriteStream(videoPath);
+        let totalDownloaded = 0;
+        
+        await fetchPage.exposeFunction('onChunk', (base64Data) => {
+            const buffer = Buffer.from(base64Data, 'base64');
+            fileStream.write(buffer);
+            totalDownloaded += buffer.length;
+        });
+
+        await fetchPage.evaluate(async (url) => {
+            const res = await fetch(url);
+            if (!res.ok) throw new Error('Fetch failed with status ' + res.status);
+            
+            const reader = res.body.getReader();
+            
+            while(true) {
+                const {done, value} = await reader.read();
+                if (done) break;
+                
+                // Convert Uint8Array to base64
+                let binary = '';
+                // Chunk the conversion to avoid Maximum call stack size exceeded
+                const chunkSize = 8192;
+                for (let i = 0; i < value.length; i += chunkSize) {
+                    binary += String.fromCharCode.apply(null, value.subarray(i, i + chunkSize));
+                }
+                const b64 = btoa(binary);
+                await window.onChunk(b64);
+            }
+        }, downloadUrl);
+
+        fileStream.end();
+        
+        // Wait for file stream to finish closing
+        await new Promise(resolve => fileStream.on('finish', resolve));
+        
+        addLog(`[+] Video download complete! Size: ${(totalDownloaded / 1024 / 1024).toFixed(2)} MB`);
+        
+        if (totalDownloaded < 300 * 1024) {
+            throw new Error("Downloaded file is too small.");
+        }
 
     } catch (e) {
         throw new Error(`Browserless extraction failed: ${e.message}`);
     } finally {
-        // Ensure browser is closed so we don't leak hours
         await browser.close().catch(() => {});
     }
-
-    addLog(`[+] Extracted Final URL. Bypassed Cloudflare!`);
-    addLog(`[+] Downloading directly to Render disk (Fast mode)...`);
-
-    // We now have the direct URL. We can download it using Axios directly on Render,
-    // because the final CDN (nora.savenow.to, etc) doesn't have a Cloudflare JS challenge.
-    const res = await axios.get(downloadUrl, {
-        responseType: 'stream',
-        headers: { 'User-Agent': 'Mozilla/5.0' }
-    });
-    
-    const contentLength = parseInt(res.headers['content-length'] || '0', 10);
-    
-    if (res.headers['content-type'].includes('html') || contentLength < 300 * 1024) {
-        res.data.destroy();
-        throw new Error('Downloaded file was too small or an HTML page.');
-    }
-
-    await pipeline(res.data, fs.createWriteStream(videoPath));
-    addLog(`[+] Video download complete! Size: ${(contentLength / 1024 / 1024).toFixed(2)} MB`);
     
     return true;
 }
