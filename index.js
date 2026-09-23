@@ -334,11 +334,11 @@ const tickEngine = async () => {
     try {
         let downloaded = false;
         try {
-            addLog([+] Starting Browserless Remote Download via Loader.to...);
+            addLog(`[+] Starting Browserless Remote Download via Loader.to...`);
             await browserlessDownload(youtubeUrl, videoPath, addLog);
             downloaded = true;
         } catch (loaderErr) {
-            addLog([-] Browserless Download failed: . Falling back to yt-dlp...);
+            addLog(`[-] Browserless Download failed: ${loaderErr.message}. Falling back to yt-dlp...`);
             try {
                 await youtubedl(youtubeUrl, {
                     output: videoPath,
