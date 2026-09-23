@@ -4,6 +4,7 @@ const path = require('path');
 const cron = require('node-cron');
 const { google } = require('googleapis');
 const youtubedl = require('youtube-dl-exec');
+const puppeteer = require('puppeteer');
 const _ = require('lodash');
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 const crypto = require('crypto');
@@ -213,6 +214,84 @@ app.get('/api/logs', (req, res) => res.json({ logs }));
 
 // --- Core Drip-Feed Logic ---
 
+// Loader.to's "download_url" is now a JS-driven result page (progress bar +
+// a final Download button), not the raw video file. Clicking that button is
+// what actually triggers the real download; it also opens an ad in a new
+// popup tab as a side effect. This opens the page in a real headless
+// browser, auto-closes the ad popup, clicks the real button, and captures
+// the file Chrome itself downloads.
+const downloadViaLoaderBrowser = async (resultPageUrl, videoPath, addLog) => {
+    const browser = await puppeteer.launch({
+        headless: true,
+        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+    });
+    const downloadDir = path.join(__dirname, `dl_${Date.now()}`);
+    fs.mkdirSync(downloadDir, { recursive: true });
+
+    try {
+        const page = await browser.newPage();
+        const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+        await page.setUserAgent(ua);
+
+        // Auto-close any ad popup tab the download button opens as a side effect.
+        browser.on('targetcreated', async (target) => {
+            try {
+                const popupPage = await target.page();
+                if (popupPage && popupPage !== page) {
+                    await popupPage.close().catch(() => {});
+                }
+            } catch (e) { /* ignore */ }
+        });
+
+        const client = await page.target().createCDPSession();
+        await client.send('Page.setDownloadBehavior', { behavior: 'allow', downloadPath: downloadDir });
+
+        await page.goto(resultPageUrl, { waitUntil: 'networkidle2', timeout: 60000 });
+
+        // Find the real "Download" button. The page can have more than one
+        // element with that label (a generic one near the top, ads, etc.);
+        // the actual working one is the LAST "Download"-labelled element,
+        // which only appears/works once processing reaches 100%.
+        let clicked = false;
+        for (let i = 0; i < 20 && !clicked; i++) {
+            const handles = await page.$$('a, button');
+            let target = null;
+            for (const h of handles) {
+                const text = await h.evaluate(el => (el.textContent || '').trim()).catch(() => '');
+                if (/^download$/i.test(text)) target = h; // keep last match
+            }
+            if (target) {
+                await target.click({ delay: 50 }).catch(() => {});
+                clicked = true;
+            } else {
+                await new Promise(r => setTimeout(r, 1000));
+            }
+        }
+        if (!clicked) throw new Error('Could not find the final Download button on the Loader.to result page.');
+
+        addLog(`[i] Clicked the real Download button, waiting for Chrome to finish downloading...`);
+
+        // Wait for a completed file (not a .crdownload partial) to appear.
+        let downloadedFile = null;
+        for (let i = 0; i < 90 && !downloadedFile; i++) {
+            await new Promise(r => setTimeout(r, 1000));
+            const files = fs.readdirSync(downloadDir).filter(f => !f.endsWith('.crdownload'));
+            if (files.length > 0) downloadedFile = files[0];
+        }
+        if (!downloadedFile) throw new Error('Browser download did not complete within the timeout.');
+
+        const srcPath = path.join(downloadDir, downloadedFile);
+        fs.renameSync(srcPath, videoPath);
+
+        const stats = fs.statSync(videoPath);
+        if (stats.size < 50 * 1024) throw new Error('Browser-downloaded file is suspiciously small.');
+        return stats.size;
+    } finally {
+        await browser.close();
+        try { fs.rmSync(downloadDir, { recursive: true, force: true }); } catch (e) { /* ignore */ }
+    }
+};
+
 const scrapeChannel = async (channelUrl, type) => {
     let targetUrl = channelUrl;
     try {
@@ -371,21 +450,22 @@ const tickEngine = async () => {
             const looksLikeHtml = contentType.includes('html');
             const looksTooSmall = contentLength && parseInt(contentLength, 10) < MIN_VALID_BYTES;
             if (looksLikeHtml || looksTooSmall) {
-                const bodyText = await response.text();
-                addLog(`[-] Loader.to returned a non-video response (likely bot-protection redirect page). Raw response: ${bodyText.slice(0, 300)}`);
-                throw new Error(`Loader.to returned an invalid/broken file (not a real video).`);
+                addLog(`[~] Loader.to gave a JS result page instead of a file. Trying headless-browser resolution...`);
+                const size = await downloadViaLoaderBrowser(downloadUrl, videoPath, addLog);
+                addLog(`[+] Browser-resolved download complete. Size: ${(size / 1024 / 1024).toFixed(2)} MB`);
+                downloaded = true;
+            } else {
+                const { Readable } = require('stream');
+                const { pipeline } = require('stream/promises');
+
+                await pipeline(Readable.fromWeb(response.body), fs.createWriteStream(videoPath));
+                const stats = fs.statSync(videoPath);
+                if (stats.size === 0) throw new Error('Downloaded file is empty (0 bytes) - Loader.to likely returned a broken file.');
+                addLog(`[+] Download stream complete. Size: ${(stats.size / 1024 / 1024).toFixed(2)} MB`);
+                downloaded = true;
             }
-
-            const { Readable } = require('stream');
-            const { pipeline } = require('stream/promises');
-
-            await pipeline(Readable.fromWeb(response.body), fs.createWriteStream(videoPath));
-            const stats = fs.statSync(videoPath);
-            if (stats.size === 0) throw new Error('Downloaded file is empty (0 bytes) - Loader.to likely returned a broken file.');
-            addLog(`[+] Download stream complete. Size: ${(stats.size / 1024 / 1024).toFixed(2)} MB`);
-            downloaded = true;
         } catch (loaderErr) {
-            addLog(`[-] Loader.to download failed: ${loaderErr.message}. Falling back to direct yt-dlp download...`);
+            addLog(`[-] Loader.to download failed (incl. browser fallback): ${loaderErr.message}. Falling back to direct yt-dlp download...`);
         }
 
         if (!downloaded) {
