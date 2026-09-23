@@ -74,35 +74,48 @@ async function attemptLoaderDownload(proxy, youtubeUrl, videoPath) {
 }
 
 async function smartProxyDownload(youtubeUrl, videoPath, addLog) {
-    if (proxyPool.length < 10) await refreshProxies();
+    if (proxyPool.length < 50) await refreshProxies();
 
-    const proxies = getRandomProxies(5);
-    if (proxies.length === 0) throw new Error("No proxies available.");
+    let maxBatches = 5; // Try up to 5 batches of 5 proxies (25 proxies total)
     
-    addLog(`[~] Racing 5 proxies for loader.to: ${proxies.join(', ')}`);
+    for (let batch = 1; batch <= maxBatches; batch++) {
+        const proxies = getRandomProxies(5);
+        if (proxies.length === 0) throw new Error("No proxies available.");
+        
+        addLog(`[~] Batch ${batch}/${maxBatches}: Racing 5 proxies for loader.to...`);
 
-    return new Promise((resolve, reject) => {
-        let failures = 0;
-        let finished = false;
+        try {
+            await new Promise((resolve, reject) => {
+                let failures = 0;
+                let finished = false;
 
-        for (const proxy of proxies) {
-            attemptLoaderDownload(proxy, youtubeUrl, videoPath)
-                .then(result => {
-                    if (finished) return;
-                    finished = true;
-                    addLog(`[+] Proxy ${proxy} WON! Downloaded successfully. Size: ${(result.size / 1024 / 1024).toFixed(2)} MB`);
-                    resolve(true);
-                })
-                .catch(err => {
-                    if (finished) return;
-                    addLog(`[-] Proxy ${proxy} failed: ${err.message}`);
-                    failures++;
-                    if (failures === proxies.length) {
-                        reject(new Error("All 5 proxies failed."));
-                    }
-                });
+                for (const proxy of proxies) {
+                    attemptLoaderDownload(proxy, youtubeUrl, videoPath)
+                        .then(result => {
+                            if (finished) return;
+                            finished = true;
+                            addLog(`[+] Proxy ${proxy} WON! Downloaded successfully. Size: ${(result.size / 1024 / 1024).toFixed(2)} MB`);
+                            resolve(true);
+                        })
+                        .catch(err => {
+                            if (finished) return;
+                            // addLog(`[-] Proxy ${proxy} failed: ${err.message}`); // Optional: mute individual fails to reduce log spam
+                            failures++;
+                            if (failures === proxies.length) {
+                                reject(new Error(`All 5 proxies in batch ${batch} failed.`));
+                            }
+                        });
+                }
+            });
+            // If Promise resolves, we are done!
+            return true;
+        } catch (batchErr) {
+            addLog(`[-] ${batchErr.message}`);
+            if (batch === maxBatches) {
+                throw new Error("All proxy batches failed.");
+            }
         }
-    });
+    }
 }
 
 module.exports = { smartProxyDownload };
