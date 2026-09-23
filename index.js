@@ -360,7 +360,15 @@ const tickEngine = async () => {
         const contentLength = response.headers.get('content-length');
         addLog(`[i] Loader.to CDN response: status=${response.status}, content-length=${contentLength || 'unknown'}`);
         if (!response.ok) throw new Error(`Download failed from Loader.to (HTTP ${response.status})`);
-        if (contentLength === '0') throw new Error('Loader.to CDN returned an empty file (content-length: 0) - likely hotlink/bot protection or an expired link.');
+
+        // A real video is at minimum a few hundred KB. If the body is tiny,
+        // it's almost certainly an error/JSON payload disguised as a 200, not a video.
+        const MIN_VALID_BYTES = 50 * 1024; // 50 KB
+        if (contentLength && parseInt(contentLength, 10) < MIN_VALID_BYTES) {
+            const bodyText = await response.text();
+            addLog(`[-] Loader.to returned a tiny ${contentLength}-byte body instead of a video. Raw response: ${bodyText.slice(0, 500)}`);
+            throw new Error(`Loader.to returned an invalid/broken file (${contentLength} bytes, not a real video).`);
+        }
 
         const { Readable } = require('stream');
         const { pipeline } = require('stream/promises');
