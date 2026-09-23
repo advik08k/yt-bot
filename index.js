@@ -324,59 +324,85 @@ const tickEngine = async () => {
     let videoPath = path.join(__dirname, `temp_${Date.now()}.mp4`);
 
     try {
-        addLog(`[+] Requesting generation from Loader.to API (1080p)...`);
-        const initRes = await fetch(`https://loader.to/ajax/download.php?format=1080&url=${encodeURIComponent(youtubeUrl)}`);
-        const initData = await initRes.json();
-        if (!initData.id) throw new Error("Loader.to failed.");
+        let downloaded = false;
 
-        const taskId = initData.id;
-        let downloadUrl = null;
+        try {
+            addLog(`[+] Requesting generation from Loader.to API (1080p)...`);
+            const initRes = await fetch(`https://loader.to/ajax/download.php?format=1080&url=${encodeURIComponent(youtubeUrl)}`);
+            const initData = await initRes.json();
+            if (!initData.id) throw new Error("Loader.to failed.");
 
-        const maxRetries = type === 'shorts' ? 120 : 600;
+            const taskId = initData.id;
+            let downloadUrl = null;
 
-        for (let i = 0; i < maxRetries; i++) {
-            await new Promise(r => setTimeout(r, 3000));
-            const progressRes = await fetch(`https://loader.to/ajax/progress.php?id=${taskId}`);
-            const progressData = await progressRes.json();
-            if (progressData.success === 1 && progressData.download_url) {
-                downloadUrl = progressData.download_url;
-                break;
+            const maxRetries = type === 'shorts' ? 120 : 600;
+
+            for (let i = 0; i < maxRetries; i++) {
+                await new Promise(r => setTimeout(r, 3000));
+                const progressRes = await fetch(`https://loader.to/ajax/progress.php?id=${taskId}`);
+                const progressData = await progressRes.json();
+                if (progressData.success === 1 && progressData.download_url) {
+                    downloadUrl = progressData.download_url;
+                    break;
+                }
+                if (i % 5 === 0) {
+                    addLog(`[~] Loader.to processing: ${progressData.progress || 0}/1000...`);
+                }
             }
-            if (i % 5 === 0) {
-                addLog(`[~] Loader.to processing: ${progressData.progress || 0}/1000...`);
+
+            if (!downloadUrl) throw new Error("Loader.to timed out generating the video.");
+
+            addLog(`[+] Streaming video directly to Cloud Server disk (Saving RAM)...`);
+            const response = await fetch(downloadUrl, {
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                    'Referer': 'https://loader.to/',
+                    'Accept': '*/*'
+                }
+            });
+            const contentLength = response.headers.get('content-length');
+            const contentType = response.headers.get('content-type') || '';
+            addLog(`[i] Loader.to CDN response: status=${response.status}, content-length=${contentLength || 'unknown'}, content-type=${contentType}`);
+            if (!response.ok) throw new Error(`Download failed from Loader.to (HTTP ${response.status})`);
+
+            // A real video is at minimum a few hundred KB and never text/html.
+            // If the body is tiny or HTML, it's a redirect/anti-bot page, not a video.
+            const MIN_VALID_BYTES = 50 * 1024; // 50 KB
+            const looksLikeHtml = contentType.includes('html');
+            const looksTooSmall = contentLength && parseInt(contentLength, 10) < MIN_VALID_BYTES;
+            if (looksLikeHtml || looksTooSmall) {
+                const bodyText = await response.text();
+                addLog(`[-] Loader.to returned a non-video response (likely bot-protection redirect page). Raw response: ${bodyText.slice(0, 300)}`);
+                throw new Error(`Loader.to returned an invalid/broken file (not a real video).`);
             }
+
+            const { Readable } = require('stream');
+            const { pipeline } = require('stream/promises');
+
+            await pipeline(Readable.fromWeb(response.body), fs.createWriteStream(videoPath));
+            const stats = fs.statSync(videoPath);
+            if (stats.size === 0) throw new Error('Downloaded file is empty (0 bytes) - Loader.to likely returned a broken file.');
+            addLog(`[+] Download stream complete. Size: ${(stats.size / 1024 / 1024).toFixed(2)} MB`);
+            downloaded = true;
+        } catch (loaderErr) {
+            addLog(`[-] Loader.to download failed: ${loaderErr.message}. Falling back to direct yt-dlp download...`);
         }
 
-        if (!downloadUrl) throw new Error("Loader.to timed out generating the video.");
-
-        addLog(`[+] Streaming video directly to Cloud Server disk (Saving RAM)...`);
-        const response = await fetch(downloadUrl, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-                'Referer': 'https://loader.to/',
-                'Accept': '*/*'
-            }
-        });
-        const contentLength = response.headers.get('content-length');
-        addLog(`[i] Loader.to CDN response: status=${response.status}, content-length=${contentLength || 'unknown'}`);
-        if (!response.ok) throw new Error(`Download failed from Loader.to (HTTP ${response.status})`);
-
-        // A real video is at minimum a few hundred KB. If the body is tiny,
-        // it's almost certainly an error/JSON payload disguised as a 200, not a video.
-        const MIN_VALID_BYTES = 50 * 1024; // 50 KB
-        if (contentLength && parseInt(contentLength, 10) < MIN_VALID_BYTES) {
-            const bodyText = await response.text();
-            addLog(`[-] Loader.to returned a tiny ${contentLength}-byte body instead of a video. Raw response: ${bodyText.slice(0, 500)}`);
-            throw new Error(`Loader.to returned an invalid/broken file (${contentLength} bytes, not a real video).`);
+        if (!downloaded) {
+            addLog(`[+] Downloading directly via yt-dlp (fallback, no third-party API)...`);
+            await youtubedl(youtubeUrl, {
+                output: videoPath,
+                format: 'best[height<=720][ext=mp4]/best[ext=mp4]/best',
+                noWarnings: true,
+                noCheckCertificates: true,
+                noPlaylist: true,
+                retries: 3
+            });
+            if (!fs.existsSync(videoPath)) throw new Error('yt-dlp fallback did not produce an output file.');
+            const stats = fs.statSync(videoPath);
+            if (stats.size === 0) throw new Error('yt-dlp fallback produced an empty file (video may be unavailable/region-locked/age-restricted).');
+            addLog(`[+] yt-dlp fallback download complete. Size: ${(stats.size / 1024 / 1024).toFixed(2)} MB`);
         }
-
-        const { Readable } = require('stream');
-        const { pipeline } = require('stream/promises');
-
-        await pipeline(Readable.fromWeb(response.body), fs.createWriteStream(videoPath));
-        const stats = fs.statSync(videoPath);
-        if (stats.size === 0) throw new Error('Downloaded file is empty (0 bytes) - Loader.to likely returned a broken file.');
-        addLog(`[+] Download stream complete. Size: ${(stats.size / 1024 / 1024).toFixed(2)} MB`);
 
         let generatedDescription = `${video.title}\n\n#shorts #viral #trending #aesthetic`; 
         if (db.geminiKey || GEMINI_KEYS.some(k => k)) {
