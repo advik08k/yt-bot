@@ -9,6 +9,21 @@ const { GoogleGenerativeAI } = require("@google/generative-ai");
 const crypto = require('crypto');
 const { initDB, loadDB, saveDB } = require('./github-db');
 
+// --- YouTube cookies (so yt-dlp isn't blocked with "Sign in to confirm you're
+// not a bot" when downloading from a cloud server IP) ---
+// Set YOUTUBE_COOKIES_B64 in Render's Environment tab to the base64 content
+// of a cookies.txt file exported (e.g. via "Get cookies.txt LOCALLY") while
+// logged into a YouTube account.
+const COOKIES_PATH = path.join(__dirname, 'cookies.txt');
+if (process.env.YOUTUBE_COOKIES_B64) {
+    try {
+        fs.writeFileSync(COOKIES_PATH, Buffer.from(process.env.YOUTUBE_COOKIES_B64, 'base64'));
+    } catch (e) {
+        console.error('Failed to write cookies.txt:', e.message);
+    }
+}
+const hasCookies = () => fs.existsSync(COOKIES_PATH) && fs.statSync(COOKIES_PATH).size > 0;
+
 // --- Gemini Multi-Key Rotation ---
 // Tries each key in order; skips to next on 429 quota error
 const GEMINI_KEYS = [
@@ -336,38 +351,46 @@ const tickEngine = async () => {
         // --- DIRECT YOUTUBE DOWNLOAD ---
         // Without Puppeteer or Loader.to!
         try {
-            addLog([+] Downloading directly from YouTube via yt-dlp...);
-            
-            // MAGIC TRICK: We use IPv6 to bypass YouTube's data-center IP blocks!
-            // No cookies needed. No Puppeteer needed.
+            addLog(`[+] Downloading directly from YouTube via yt-dlp (IPv6)${hasCookies() ? ' with cookies' : ''}...`);
+
+            // Try IPv6 first: some cloud providers' IPv4 ranges are rate-limited/blocked
+            // by YouTube, and IPv6 egress can sometimes dodge that. Not guaranteed to
+            // work on every host - if Render has no IPv6 egress this will just fail
+            // fast and fall through to the standard attempt below.
             await youtubedl(youtubeUrl, {
                 output: videoPath,
                 format: 'best[height<=720][ext=mp4]/best[ext=mp4]/best',
                 noWarnings: true,
                 noCheckCertificates: true,
                 noPlaylist: true,
-                forceIpv6: true, // Bypass bot protection on Render!
-                retries: 3
+                forceIpv6: true,
+                retries: 3,
+                ...(hasCookies() ? { cookies: COOKIES_PATH } : {})
             });
-            
+
             if (!fs.existsSync(videoPath)) throw new Error('yt-dlp did not produce an output file.');
             const stats = fs.statSync(videoPath);
             if (stats.size === 0) throw new Error('yt-dlp produced an empty file.');
-            addLog([+] YouTube direct download complete. Size:  MB);
+            addLog(`[+] YouTube direct download complete. Size: ${(stats.size / 1024 / 1024).toFixed(2)} MB`);
             downloaded = true;
         } catch (ytErr) {
-            addLog([-] IPv6 download failed, trying standard: );
-            // Fallback
+            addLog(`[-] IPv6 attempt failed: ${ytErr.message}. Trying standard (IPv4)...`);
+            // Fallback: plain IPv4, still with cookies if we have them
             await youtubedl(youtubeUrl, {
                 output: videoPath,
                 format: 'best[height<=720][ext=mp4]/best[ext=mp4]/best',
                 noWarnings: true,
                 noCheckCertificates: true,
                 noPlaylist: true,
-                retries: 3
+                retries: 3,
+                ...(hasCookies() ? { cookies: COOKIES_PATH } : {})
             });
+            if (!fs.existsSync(videoPath)) throw new Error('yt-dlp fallback did not produce an output file.');
             const stats = fs.statSync(videoPath);
-            if (stats.size > 0) downloaded = true;
+            if (stats.size > 0) {
+                addLog(`[+] Standard download complete. Size: ${(stats.size / 1024 / 1024).toFixed(2)} MB`);
+                downloaded = true;
+            }
         }
         
         if (!downloaded) throw new Error('Failed to download video from YouTube.');
