@@ -1,6 +1,6 @@
 const express = require('express');
 const fs = require('fs');
-const { smartProxyDownload } = require('./proxyDownloader');
+const { browserlessDownload } = require('./browserlessDownloader');
 const path = require('path');
 const cron = require('node-cron');
 const { google } = require('googleapis');
@@ -334,11 +334,11 @@ const tickEngine = async () => {
     try {
         let downloaded = false;
         try {
-            addLog(`[+] Starting Smart Proxy Download via Loader.to...`);
-            await smartProxyDownload(youtubeUrl, videoPath, addLog);
+            addLog([+] Starting Browserless Remote Download via Loader.to...);
+            await browserlessDownload(youtubeUrl, videoPath, addLog);
             downloaded = true;
         } catch (loaderErr) {
-            addLog(`[-] Smart Proxy Download failed: ${loaderErr.message}. Falling back to yt-dlp...`);
+            addLog([-] Browserless Download failed: . Falling back to yt-dlp...);
             try {
                 await youtubedl(youtubeUrl, {
                     output: videoPath,
@@ -355,7 +355,7 @@ const tickEngine = async () => {
                 // Ignore fallback error
             }
         }
-        if (!downloaded) throw new Error('Failed to download video using both Loader+Proxy and yt-dlp.');
+        if (!downloaded) throw new Error('Failed to download video using both Browserless and yt-dlp.');
         let generatedDescription = `${video.title}\n\n#shorts #viral #trending #aesthetic`; 
         if (db.geminiKey || GEMINI_KEYS.some(k => k)) {
             try {
